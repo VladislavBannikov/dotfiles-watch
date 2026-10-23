@@ -1,0 +1,5 @@
+#!/bin/sh
+# Block commits that contain plain-text secrets (rules: ~/.config/dotfiles-watch/gitleaks.toml)
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+exec gitleaks git --pre-commit --staged --redact --no-banner \
+  --config "$HOME/.config/dotfiles-watch/gitleaks.toml" .

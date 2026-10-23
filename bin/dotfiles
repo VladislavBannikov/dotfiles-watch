@@ -1,0 +1,426 @@
+#!/bin/bash
+# dotfiles: watch chezmoi-tracked config files, review and commit changes.
+# Used by the SwiftBar plugin (menu), the launchd watcher (check) and by hand.
+#
+#   dotfiles menu              print the SwiftBar menu
+#   dotfiles check             detect changes, show a banner for new ones, refresh SwiftBar
+#   dotfiles list              print changed files, one absolute path per line
+#   dotfiles diff FILE         open IntelliJ diff: repo version vs local file
+#   dotfiles approve FILE      re-add FILE to chezmoi and commit (asks for a message)
+#   dotfiles approve-all       the same for every changed file, one commit
+#   dotfiles reject FILE       restore the repo version of FILE (asks first)
+#   dotfiles push              git push the dotfiles repo
+#   dotfiles show-commits [SHA] open unpushed commits (or one commit) as a patch
+#   dotfiles undo-commit       drop the latest unpushed commit, files show as changed again
+#   dotfiles track             pick a new file to track
+#   dotfiles banners on|off|toggle
+#   dotfiles ai on|off|toggle   AI-written commit messages (local LM Studio model)
+#   dotfiles suggest FILE...    print the AI commit message for these files
+#   dotfiles install-watcher   (re)write and load the launchd watcher
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+
+SELF="$HOME/.local/bin/dotfiles"
+CONF_DIR="$HOME/.config/dotfiles-watch"
+STATE_DIR="$HOME/.cache/dotfiles-watch"
+SETTINGS="$CONF_DIR/settings"
+GITLEAKS_CONF="$CONF_DIR/gitleaks.toml"
+LABEL="local.dotfiles-watch"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+IDEA="$HOME/Library/Application Support/JetBrains/Toolbox/scripts/idea"
+
+mkdir -p "$CONF_DIR" "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+SRC_DIR="$(chezmoi source-path)"
+
+# ---------- helpers ----------
+
+setting() { # setting NAME DEFAULT
+  local v
+  v=$(grep -E "^$1=" "$SETTINGS" 2>/dev/null | tail -1 | cut -d= -f2-)
+  echo "${v:-$2}"
+}
+
+set_setting() { # set_setting NAME VALUE
+  touch "$SETTINGS"
+  grep -vE "^$1=" "$SETTINGS" > "$SETTINGS.tmp"
+  echo "$1=$2" >> "$SETTINGS.tmp"
+  mv "$SETTINGS.tmp" "$SETTINGS"
+}
+
+short() { echo "~/${1#"$HOME"/}"; }
+
+changed_files() {
+  chezmoi status 2>/dev/null | while IFS= read -r line; do
+    p="${line:3}"
+    [ -n "$p" ] && echo "$HOME/$p"
+  done
+}
+
+unpushed_count() {
+  git -C "$SRC_DIR" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0
+}
+
+refresh_swiftbar() {
+  open -g "swiftbar://refreshplugin?name=dotfiles" 2>/dev/null
+}
+
+# Dialog helpers pass text through argv, so quotes in file names are safe.
+notify() {
+  osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+    -e 'end run' "dotfiles" "$1" >/dev/null 2>&1
+}
+
+alert() {
+  osascript -e 'on run argv' -e 'display alert (item 1 of argv) message (item 2 of argv) as critical' \
+    -e 'end run' "$1" "$2" >/dev/null 2>&1
+}
+
+ask_text() { # ask_text PROMPT DEFAULT -> prints answer, fails on Cancel
+  osascript -e 'on run argv' \
+    -e 'activate' \
+    -e 'text returned of (display dialog (item 1 of argv) default answer (item 2 of argv) with title "dotfiles" buttons {"Cancel", "Commit"} default button "Commit")' \
+    -e 'end run' "$1" "$2" 2>/dev/null
+}
+
+confirm() { # confirm PROMPT BUTTON -> succeeds only when BUTTON was clicked
+  osascript -e 'on run argv' \
+    -e 'display dialog (item 1 of argv) with title "dotfiles" buttons {"Cancel", (item 2 of argv)} default button "Cancel" with icon caution' \
+    -e 'end run' "$1" "$2" >/dev/null 2>&1
+}
+
+is_encrypted() { case "$(basename "$(chezmoi source-path "$1" 2>/dev/null)")" in encrypted_*) return 0 ;; esac; return 1; }
+
+# check_secrets FILE -> fails and shows an alert when FILE looks like it holds a secret
+check_secrets() {
+  local f="$1" report line
+  is_encrypted "$f" && return 0
+  report=$(gitleaks dir --config "$GITLEAKS_CONF" --redact --no-banner \
+    --report-format json --report-path - "$f" 2>/dev/null) && return 0
+  line=$(echo "$report" | grep -oE '"StartLine": *[0-9]+' | head -1 | grep -oE '[0-9]+$')
+  alert "Blocked: possible secret" "$(short "$f") line ${line:-?} looks like it holds a password or token.
+
+Move it to ~/.zshrc.local (stored encrypted), then try again."
+  return 1
+}
+
+default_message() { # default_message FILE -> "zshrc: update"
+  local b
+  b=$(basename "$1")
+  echo "${b#.}: update"
+}
+
+LLM_URL="http://127.0.0.1:1234/v1/chat/completions"
+
+# Python part of ai_message; read with read -d '' because /bin/bash 3.2 mis-parses heredocs inside $( )
+read -r -d '' AI_PY <<'PY'
+import json, sys, urllib.request
+url, model, diff = sys.argv[1:4]
+system = ("You write git commit messages for a personal dotfiles repo. Reply with ONE line only, "
+          "max 60 characters, in the form '<area>: <what changed>', imperative mood, "
+          "for example 'zshrc: add codex_pers function'. No quotes, no period at the end.")
+body = {"model": model, "temperature": 0.2, "max_tokens": 3000,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": "Diff:\n" + diff}]}
+req = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
+text = json.load(urllib.request.urlopen(req, timeout=40))["choices"][0]["message"]["content"]
+line = next((l for l in text.splitlines() if l.strip()), "")
+print(line.strip().strip(chr(96) + "'\"").rstrip(".")[:72])
+PY
+
+# ai_message FALLBACK FILE... -> one-line message from the local model, or FALLBACK.
+# Encrypted files are never sent; the diff stays on this Mac (localhost only).
+ai_message() {
+  local fallback="$1" f diff="" msg
+  shift
+  [ "$(setting ai on)" = on ] || { echo "$fallback"; return; }
+  for f in "$@"; do
+    is_encrypted "$f" && { echo "$fallback"; return; }
+    diff+=$(chezmoi diff --reverse --no-pager "$f" 2>/dev/null | head -200)$'\n'
+  done
+  [ -n "${diff//[$'\n ']/}" ] || { echo "$fallback"; return; }
+  notify "Writing commit message with the local model…"
+  msg=$(python3 -I -c "$AI_PY" "$LLM_URL" "$(setting ai_model google/gemma-4-e4b)" "$diff" 2>/dev/null)
+  echo "${msg:-$fallback}"
+}
+
+# ---------- commands ----------
+
+cmd_list() { changed_files; }
+
+cmd_check() { # cmd_check [--no-refresh]
+  local now="$STATE_DIR/changed" before="$STATE_DIR/changed.prev" new
+  mkdir "$STATE_DIR/lock" 2>/dev/null || return 0
+  [ -f "$now" ] && cp "$now" "$before" || : > "$before"
+  changed_files | sort > "$now"
+  new=$(comm -13 "$before" "$now")
+  if [ -n "$new" ] && [ "$(setting banners on)" = on ]; then
+    notify "Changed: $(echo "$new" | while read -r f; do short "$f"; done | paste -sd ',' - | sed 's/,/, /g')"
+  fi
+  # remove decrypted diff copies older than 10 minutes
+  find "$STATE_DIR/diff" -type f -mmin +10 -delete 2>/dev/null
+  rmdir "$STATE_DIR/lock"
+  [ "$1" = "--no-refresh" ] || refresh_swiftbar
+}
+
+cmd_menu() {
+  cmd_check --no-refresh
+  local files n up banners repo_dirty
+  files=$(cat "$STATE_DIR/changed" 2>/dev/null)
+  n=$(printf '%s' "$files" | grep -c .)
+  up=$(unpushed_count)
+  banners=$(setting banners on)
+
+  if [ "$n" -gt 0 ]; then
+    echo "$n | sfimage=exclamationmark.triangle.fill sfcolor=#E8833A"
+  elif [ "$up" -gt 0 ]; then
+    echo "$up | sfimage=arrow.up.circle"
+  else
+    echo "| sfimage=checkmark.circle"
+  fi
+  echo "---"
+  if [ "$n" -gt 0 ]; then
+    echo "Changed config files | size=11"
+    echo "$files" | while read -r f; do
+      echo "$(short "$f") | sfimage=doc.text"
+      echo "--Show diff | bash=$SELF param1=diff param2=$f terminal=false"
+      echo "--Approve (commit)… | bash=$SELF param1=approve param2=$f terminal=false refresh=true"
+      echo "--Reject (restore repo version)… | bash=$SELF param1=reject param2=$f terminal=false refresh=true"
+    done
+    echo "---"
+    [ "$n" -gt 1 ] && echo "Approve all… | bash=$SELF param1=approve-all terminal=false refresh=true"
+  else
+    echo "All tracked configs match the repo | size=11"
+  fi
+  repo_dirty=$(git -C "$SRC_DIR" status --porcelain | grep -c .)
+  if [ "$repo_dirty" -gt 0 ]; then
+    echo "Repo has $repo_dirty uncommitted file$([ "$repo_dirty" -gt 1 ] && echo s) (open repo to review) | bash=\"$IDEA\" param1=$SRC_DIR terminal=false"
+  fi
+  if [ "$up" -gt 0 ]; then
+    echo "Commits waiting to push | size=11"
+    git -C "$SRC_DIR" log --format='%h %s' '@{u}..HEAD' | while read -r sha subject; do
+      echo "$sha  $subject | sfimage=arrow.up.doc bash=$SELF param1=show-commits param2=$sha terminal=false"
+    done
+    echo "Review all before push | bash=$SELF param1=show-commits terminal=false"
+    echo "Undo last commit… | sfimage=arrow.uturn.backward bash=$SELF param1=undo-commit terminal=false refresh=true"
+    echo "Push to GitHub ($up commit$([ "$up" -gt 1 ] && echo s) waiting) | bash=$SELF param1=push terminal=false refresh=true"
+  fi
+  echo "---"
+  if [ "$banners" = on ]; then
+    echo "Banners: ON (click to turn off) | bash=$SELF param1=banners param2=off terminal=false refresh=true"
+  else
+    echo "Banners: OFF (click to turn on) | bash=$SELF param1=banners param2=on terminal=false refresh=true"
+  fi
+  if [ "$(setting ai on)" = on ]; then
+    echo "AI commit messages: ON (click to turn off) | bash=$SELF param1=ai param2=off terminal=false refresh=true"
+  else
+    echo "AI commit messages: OFF (click to turn on) | bash=$SELF param1=ai param2=on terminal=false refresh=true"
+  fi
+  echo "Track a new file… | bash=$SELF param1=track terminal=false refresh=true"
+  echo "Open repo in IntelliJ | bash=\"$IDEA\" param1=$SRC_DIR terminal=false"
+  echo "Refresh | refresh=true"
+}
+
+cmd_diff() {
+  local f="$1" dir="$STATE_DIR/diff" left
+  # no spaces in the path: the Toolbox idea launcher wraps such arguments in literal quotes
+  mkdir -p "$dir/repo" && chmod 700 "$dir" "$dir/repo"
+  left="$dir/repo/$(basename "$f")"
+  ( umask 077; chezmoi cat "$f" > "$left" ) || { alert "Diff failed" "chezmoi cat $(short "$f") failed."; return 1; }
+  if [ -x "$IDEA" ]; then
+    "$IDEA" diff "$left" "$f" >/dev/null 2>&1 &
+  else
+    ( umask 077; chezmoi diff --reverse --no-pager "$f" > "$dir/$(basename "$f").diff" )
+    open -t "$dir/$(basename "$f").diff"
+  fi
+}
+
+commit_files() { # commit_files MESSAGE FILE... -> re-add and commit
+  local msg="$1" f src
+  shift
+  for f in "$@"; do
+    chezmoi re-add "$f" || { alert "Approve failed" "chezmoi re-add $(short "$f") failed."; return 1; }
+    src=$(chezmoi source-path "$f")
+    git -C "$SRC_DIR" add -A -- "$src"
+  done
+  if git -C "$SRC_DIR" diff --cached --quiet; then
+    notify "Nothing to commit: repo already has these changes"
+  else
+    git -C "$SRC_DIR" commit -q -m "$msg" || { alert "Commit failed" "git commit failed (see the pre-commit check)."; return 1; }
+    notify "Committed: $msg"
+  fi
+  cmd_check
+}
+
+cmd_approve() {
+  local f="$1" msg
+  check_secrets "$f" || return 1
+  # show the diff first; the AI message is written while it is on screen
+  [ "$(setting approve_diff on)" = on ] && cmd_diff "$f"
+  msg=$(ask_text "Commit message for $(short "$f"):" "$(ai_message "$(default_message "$f")" "$f")") || return 0
+  commit_files "$msg" "$f"
+}
+
+cmd_approve_all() {
+  local files f msg list
+  files=$(changed_files)
+  [ -n "$files" ] || return 0
+  for f in $files; do check_secrets "$f" || return 1; done
+  if [ "$(setting approve_diff on)" = on ]; then
+    for f in $files; do cmd_diff "$f"; done
+  fi
+  list=$(for f in $files; do short "$f"; done | paste -sd ',' - | sed 's/,/, /g')
+  # shellcheck disable=SC2086 # paths have no spaces (chezmoi-managed home files)
+  msg=$(ask_text "Commit message for: $list" "$(ai_message "dotfiles: update $(echo "$files" | grep -c .) files" $files)") || return 0
+  # shellcheck disable=SC2086 # paths have no spaces (chezmoi-managed home files)
+  commit_files "$msg" $files
+}
+
+cmd_reject() {
+  local f="$1"
+  confirm "Restore the repo version of $(short "$f")?
+
+Your local change will be lost." "Discard local change" || return 0
+  chezmoi apply --force "$f" && notify "Restored $(short "$f")"
+  cmd_check
+}
+
+# cmd_show_commits [SHA] -> open one commit, or all unpushed commits, as a patch in IntelliJ.
+# Encrypted files appear as changed blobs only, so no secret is written out.
+cmd_show_commits() {
+  local dir="$STATE_DIR/diff" out
+  mkdir -p "$dir" && chmod 700 "$dir"
+  if [ -n "$1" ]; then
+    out="$dir/commit-$1.diff"
+    git -C "$SRC_DIR" show --stat --patch "$1" > "$out"
+  else
+    out="$dir/unpushed.diff"
+    git -C "$SRC_DIR" log --reverse --stat --patch '@{u}..HEAD' > "$out"
+  fi
+  if [ -x "$IDEA" ]; then "$IDEA" "$out" >/dev/null 2>&1 & else open -t "$out"; fi
+}
+
+# cmd_undo_commit [--yes] -> drop the latest unpushed commit from the repo only.
+# Home files keep the change, so they show as changed again (Approve or Reject).
+# Repo-only files (README, hooks) and newly tracked files stay as uncommitted changes.
+cmd_undo_commit() {
+  local sha subject files p managed
+  [ "$(unpushed_count)" -gt 0 ] || { alert "Nothing to undo" "The latest commit is already on GitHub."; return 1; }
+  sha=$(git -C "$SRC_DIR" log -1 --format=%h)
+  subject=$(git -C "$SRC_DIR" log -1 --format=%s)
+  if [ "$1" != "--yes" ]; then
+    confirm "Undo commit $sha?
+
+$subject
+
+Your files keep the change and show as changed again, so you can Approve or Reject them." "Undo commit" || return 0
+  fi
+  files=$(git -C "$SRC_DIR" diff-tree --no-commit-id --name-only -r HEAD)
+  managed=$(chezmoi managed --path-style source-absolute 2>/dev/null)
+  git -C "$SRC_DIR" reset -q --soft HEAD~1
+  git -C "$SRC_DIR" reset -q
+  echo "$files" | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    grep -qxF "$SRC_DIR/$p" <<<"$managed" || continue          # repo-only file: keep as uncommitted
+    git -C "$SRC_DIR" cat-file -e "HEAD:$p" 2>/dev/null || continue  # newly tracked: keep as uncommitted
+    git -C "$SRC_DIR" checkout -q HEAD -- "$p"                 # repo back to the old version
+  done
+  notify "Undid $sha: $subject"
+  cmd_check
+}
+
+cmd_push() {
+  local out
+  if out=$(git -C "$SRC_DIR" push 2>&1); then
+    notify "Pushed to GitHub"
+  else
+    alert "Push failed" "$out"
+  fi
+  refresh_swiftbar
+}
+
+cmd_track() {
+  local f
+  f=$(osascript -e 'POSIX path of (choose file with prompt "Choose a config file to track" default location (path to home folder) with invisibles)' 2>/dev/null) || return 0
+  if ! check_secrets "$f"; then
+    return 1
+  fi
+  chezmoi add "$f" || { alert "Track failed" "chezmoi add $(short "$f") failed."; return 1; }
+  git -C "$SRC_DIR" add -A -- "$(chezmoi source-path "$f")"
+  git -C "$SRC_DIR" commit -q -m "track $(short "$f")" && notify "Now tracking $(short "$f")"
+  cmd_install_watcher
+}
+
+cmd_banners() {
+  case "$1" in
+    on|off) set_setting banners "$1" ;;
+    toggle|"") [ "$(setting banners on)" = on ] && set_setting banners off || set_setting banners on ;;
+    *) echo "usage: dotfiles banners on|off|toggle" >&2; return 2 ;;
+  esac
+  refresh_swiftbar
+}
+
+cmd_ai() {
+  case "$1" in
+    on|off) set_setting ai "$1" ;;
+    toggle|"") [ "$(setting ai on)" = on ] && set_setting ai off || set_setting ai on ;;
+    *) echo "usage: dotfiles ai on|off|toggle" >&2; return 2 ;;
+  esac
+  refresh_swiftbar
+}
+
+cmd_install_watcher() {
+  local paths
+  # watch each tracked file and its folder (catches editors that replace the file);
+  # the home folder itself changes too often, so only its files are watched
+  paths=$( { chezmoi managed --path-style absolute --exclude dirs
+             chezmoi managed --path-style absolute --exclude dirs | xargs -n1 dirname | grep -vx "$HOME"
+           } | sort -u | sed 's|.*|    <string>&</string>|')
+  mkdir -p "$(dirname "$PLIST")" "$STATE_DIR"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$SELF</string>
+    <string>check</string>
+  </array>
+  <key>WatchPaths</key>
+  <array>
+$paths
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardErrorPath</key>
+  <string>$STATE_DIR/watcher.log</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+}
+
+case "$1" in
+  menu) cmd_menu ;;
+  check) cmd_check ;;
+  list) cmd_list ;;
+  diff) cmd_diff "$2" ;;
+  approve) cmd_approve "$2" ;;
+  approve-all) cmd_approve_all ;;
+  reject) cmd_reject "$2" ;;
+  push) cmd_push ;;
+  show-commits) cmd_show_commits "$2" ;;
+  undo-commit) cmd_undo_commit "$2" ;;
+  track) cmd_track ;;
+  banners) cmd_banners "$2" ;;
+  ai) cmd_ai "$2" ;;
+  suggest) shift; ai_message "(no suggestion)" "$@" ;;
+  install-watcher) cmd_install_watcher ;;
+  *) sed -n '2,21p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

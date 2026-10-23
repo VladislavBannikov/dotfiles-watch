@@ -1,0 +1,6 @@
+# Copy to ~/.config/chezmoi/chezmoi.toml (or to .chezmoi.toml.tmpl in your chezmoi repo).
+# Get the recipient from: chezmoi age-keygen -o ~/.config/chezmoi/key.txt
+encryption = "age"
+[age]
+  identity  = "~/.config/chezmoi/key.txt"
+  recipient = "age1...your-public-key..."

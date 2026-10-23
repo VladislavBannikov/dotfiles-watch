@@ -1,0 +1,9 @@
+# gitleaks rules for dotfiles: the default rules plus plain NAME=value secrets
+[extend]
+useDefault = true
+
+[[rules]]
+id = "dotfiles-named-secret"
+description = "Variable whose name says it holds a secret, with a literal value"
+regex = '''(?i)\b[a-z0-9_]*(pass|passwd|password|token|secret|hmac|api_?key|eab_kid)[a-z0-9_]*\s*[=:]\s*['"]?([^\s'"$`<]{8,})'''
+secretGroup = 2

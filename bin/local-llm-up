@@ -1,0 +1,9 @@
+#!/bin/bash
+# Start the local LM Studio server (localhost:1234) and keep the fast model loaded.
+# Run at login by ~/Library/LaunchAgents/local.llm-server.plist. Safe to run again.
+export PATH="/opt/homebrew/bin:/usr/bin:/bin:$HOME/.lmstudio/bin"
+FAST_MODEL="google/gemma-4-e4b"
+
+lms daemon up
+lms server start --port 1234 --bind 127.0.0.1
+lms ps 2>/dev/null | grep -q "$FAST_MODEL" || lms load "$FAST_MODEL" --yes
