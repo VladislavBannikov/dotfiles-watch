@@ -80,6 +80,7 @@ Menu items:
 - **Commits waiting to push**: click a commit to see its patch; **Review all before push**; **Undo last commit…**
   (the files keep the change and show as changed again).
 - **Push to GitHub**: `git push`. Nothing leaves the Mac without this click.
+- **Open repo in IntelliJ** / **Open repo on GitHub**: the local chezmoi repo, or its GitHub page (from the `origin` remote).
 - **Banners: ON/OFF**: one macOS notification when a file *first* changes.
 - **AI commit messages: ON/OFF**: pre-fill the commit message with a local model.
 - **Track a new file…**: pick a file, it is checked for secrets, added and committed.

@@ -61,6 +61,12 @@ unpushed_count() {
   git -C "$SRC_DIR" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0
 }
 
+# repo_web_url -> https URL of the origin remote (https or git@ form), empty without a remote
+repo_web_url() {
+  git -C "$SRC_DIR" remote get-url origin 2>/dev/null |
+    sed -E -e 's|^git@([^:]+):|https://\1/|' -e 's|\.git$||'
+}
+
 refresh_swiftbar() {
   open -g "swiftbar://refreshplugin?name=dotfiles" 2>/dev/null
 }
@@ -218,6 +224,8 @@ cmd_menu() {
   fi
   echo "Track a new file… | bash=$SELF param1=track terminal=false refresh=true"
   echo "Open repo in IntelliJ | bash=\"$IDEA\" param1=$SRC_DIR terminal=false"
+  web=$(repo_web_url)
+  [ -n "$web" ] && echo "Open repo on GitHub | sfimage=globe href=$web"
   echo "Refresh | refresh=true"
 }
 
